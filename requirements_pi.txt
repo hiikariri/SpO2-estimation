@@ -1,0 +1,4 @@
+# Raspberry Pi runtime for pi_spo2.py (live SpO2).
+# The live path needs ONLY these — not pandas / PyQt5 / matplotlib / wfdb.
+numpy
+max30102        # MAX30102 I2C driver (doug-burrell). Swap if you use another.
