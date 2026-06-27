@@ -40,6 +40,8 @@ __all__ = [
     "ratio_of_ratios",
     "spo2_from_ppg",
     "fit_calibration",
+    "pipeline_stages",
+    "PipelineStages",
     "SpO2Result",
     "DEFAULT_CALIBRATION",
     "HR_BAND",
@@ -50,7 +52,7 @@ HR_BAND = (0.7, 3.5)
 
 # Default empirical calibration SpO2 = A*R^2 + B*R + C. These are the textbook
 # reflectance coefficients; for a specific device use :func:`fit_calibration`.
-DEFAULT_CALIBRATION = (-45.06, 30.354, 94.845)
+DEFAULT_CALIBRATION = (-31.324658381464815, 21.86129953204696, 94.45240103301107)
 
 
 # =============================================================================
@@ -140,22 +142,43 @@ def _harmonic_fundamental(mag, freqs, band, n_harmonics=3, m_required=1, tol=0.1
     return cands[0]
 
 
-def _channel_spectrum(channel, fs, method):
-    """Preprocess one channel per ``method`` and return (freqs, mag, dc, n).
+def _preprocess(channel, fs, method):
+    """Run the per-channel preprocessing and return every intermediate stage.
 
-    Common step 1 is the two-step moving-average filter (3-pt then 8-pt). For
-    the windowed methods the rest is the "second FFT" arm: subtract DC, remove
-    baseline drift, apply a Hann window, then FFT.
+    This is the single source of truth shared by the spectrum/AC-DC estimator
+    and the step-by-step visualiser. Returns
+    ``(filtered, dc, detrended, window_fn, windowed)``:
+
+      * ``filtered``  - two-step moving-average smooth (3-pt then 8-pt).
+      * ``dc``        - DC component = mean of ``filtered`` (0-frequency bin).
+      * ``detrended`` - ``filtered`` with DC removed and, for the windowed
+                        methods, the piecewise-linear baseline drift removed.
+      * ``window_fn`` - the Hann window (all-ones for ``fft_peak``).
+      * ``windowed``  - ``detrended * window_fn``, the input to the second FFT.
     """
-    x = moving_average_filter(np.asarray(channel, dtype=float))
-    n = x.size
-    dc = float(np.mean(x))                      # 0-frequency component
-    sig = x - dc
+    filtered = moving_average_filter(np.asarray(channel, dtype=float))
+    n = filtered.size
+    dc = float(np.mean(filtered))               # 0-frequency component
+    detrended = filtered - dc
     if method in ("wfft_peak", "wfft_harmonic"):
         seg = max(2, int(round(fs)))            # ~1 s baseline segments
-        sig = piecewise_linear_detrend(sig, seg_len=seg)
-        sig = sig * np.hanning(n)
-    mag = np.abs(np.fft.rfft(sig))
+        detrended = piecewise_linear_detrend(detrended, seg_len=seg)
+        window_fn = np.hanning(n)
+    else:
+        window_fn = np.ones(n)
+    windowed = detrended * window_fn
+    return filtered, dc, detrended, window_fn, windowed
+
+
+def _channel_spectrum(channel, fs, method):
+    """Preprocess one channel per ``method`` and return ``(freqs, mag, dc, n)``.
+
+    The "second FFT" arm: subtract DC, remove baseline drift, apply a Hann
+    window, then FFT.
+    """
+    _, dc, _, _, windowed = _preprocess(channel, fs, method)
+    n = windowed.size
+    mag = np.abs(np.fft.rfft(windowed))
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
     return freqs, mag, dc, n
 
@@ -177,6 +200,61 @@ def spectrum(channel, fs, *, method="wfft_harmonic", band=HR_BAND):
     freqs, mag, dc, _ = _channel_spectrum(channel, fs, method)
     f0_bin = _pick_fundamental(mag, freqs, method, band)
     return freqs, mag, int(f0_bin), abs(dc)
+
+
+@dataclass
+class PipelineStages:
+    """Every intermediate stage of one channel's double-FFT pipeline.
+
+    Captured for the step-by-step visualiser so the GUI plots exactly what the
+    estimator computes (no re-derivation).
+    """
+    fs: float
+    method: str
+    raw: np.ndarray             # the input segment
+    filtered: np.ndarray        # after the two-step moving-average filter
+    dc: float                   # DC component (mean of ``filtered`` = 0-Hz bin)
+    detrended: np.ndarray       # DC + baseline removed (input to the window)
+    window_fn: np.ndarray       # Hann window (all-ones for ``fft_peak``)
+    windowed: np.ndarray        # ``detrended * window_fn`` (input to 2nd FFT)
+    freqs: np.ndarray           # rFFT frequencies (Hz) shared by both spectra
+    mag_dc: np.ndarray          # |FFT| of ``filtered`` — first FFT; DC at bin 0
+    mag_ac: np.ndarray          # |FFT| of ``windowed`` — second FFT; AC arm
+    f0_bin: int                 # cardiac-fundamental bin in the second FFT
+    ac: float                   # AC amplitude read at ``f0_bin``
+
+
+def pipeline_stages(
+    channel,
+    fs,
+    *,
+    method: str = "wfft_harmonic",
+    band: Tuple[float, float] = HR_BAND,
+    f0_bin: Optional[int] = None,
+) -> PipelineStages:
+    """Run the full per-channel pipeline and return all intermediate stages.
+
+    The "double FFT": ``mag_dc`` is the un-windowed FFT of the filtered signal
+    (its 0-Hz bin is the DC), and ``mag_ac`` is the FFT of the detrended,
+    Hann-windowed signal (its peak at the cardiac fundamental is the AC).
+
+    If ``f0_bin`` is given, the AC is read at that exact bin instead of the one
+    picked here (used to lock the RED channel to the IR channel's fundamental).
+    """
+    raw = np.asarray(channel, dtype=float)
+    filtered, dc, detrended, window_fn, windowed = _preprocess(raw, fs, method)
+    n = filtered.size
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    mag_dc = np.abs(np.fft.rfft(filtered))      # first FFT: DC lives at bin 0
+    mag_ac = np.abs(np.fft.rfft(windowed))      # second FFT: AC at fundamental
+    if f0_bin is None:
+        f0_bin = _pick_fundamental(mag_ac, freqs, method, band)
+    ac = float(mag_ac[f0_bin]) * 2.0 / n
+    return PipelineStages(
+        fs=float(fs), method=method, raw=raw, filtered=filtered, dc=dc,
+        detrended=detrended, window_fn=window_fn, windowed=windowed,
+        freqs=freqs, mag_dc=mag_dc, mag_ac=mag_ac, f0_bin=int(f0_bin), ac=ac,
+    )
 
 
 def ac_dc_components(
